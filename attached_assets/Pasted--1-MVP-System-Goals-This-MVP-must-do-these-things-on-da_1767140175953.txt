@@ -1,0 +1,339 @@
+# 1) MVP System Goals
+
+This MVP must do these things on day 1...
+
+* Run on **one Alpaca account** (paper first)
+* Fail closed... meaning if something breaks, it halts trading
+* Log everything (JSONL)
+* Store state durably (SQLite file)
+* Run all execution bots every loop, but only trade if preflight passes
+* Let you deploy multiple MomentumBots per ticker from config
+* OptionsBot and CryptoBot exist and run, but strategy logic starts as placeholder until you paste your edge
+
+---
+
+# 2) Repo scaffolding
+
+```
+trading_hydra_mvp/
+  .env.example
+  pyproject.toml
+  README.md
+
+  config/
+    settings.yaml
+    bots.yaml
+
+  state/
+    trading_state.db
+
+  logs/
+    app.jsonl
+
+  src/
+    core/
+      broker.py
+      alpaca_broker.py
+      state_store.py
+      logger.py
+      clock.py
+      util.py
+      health.py
+      risk.py
+
+    bots/
+      exitbot.py
+      portfoliobot.py
+      momentumbot.py
+      optionsbot.py
+      cryptobot.py
+
+    runner/
+      main.py
+      bootstrap.py
+      scheduler.py
+
+    tools/
+      analyst_prompt.txt
+
+  tests/
+    test_preflight.py
+    test_state_store.py
+```
+
+---
+
+# 3) Configs
+
+## `.env.example`
+
+```bash
+ALPACA_KEY="YOUR_KEY"
+ALPACA_SECRET="YOUR_SECRET"
+ALPACA_PAPER="true"
+```
+
+## `config/settings.yaml`
+
+```yaml
+system:
+  timezone: America/Los_Angeles
+  log_path: ./logs/app.jsonl
+  state_db_path: ./state/trading_state.db
+
+runner:
+  loop_interval_seconds: 5
+
+safety:
+  fail_closed: true
+  allow_budget_fallback: false
+  global_cooldown_minutes: 390
+
+risk:
+  global_max_daily_loss_pct: 1.0
+  max_orders_per_minute: 10
+
+health:
+  max_price_staleness_seconds: 15
+  max_api_failures_in_window: 5
+  api_failure_window_seconds: 60
+```
+
+## `config/bots.yaml`
+
+```yaml
+exitbot:
+  enabled: true
+  cooloff_minutes: 390
+  kill_conditions:
+    api_failure_halt: true
+    data_stale_halt: true
+    max_daily_loss_halt: true
+    anomaly_halt: true
+
+portfoliobot:
+  enabled: true
+  cash_reserve_pct: 30
+  buckets:
+    momentum_bucket_pct_of_daily_risk: 25
+    options_bucket_pct_of_daily_risk: 50
+    crypto_bucket_pct_of_daily_risk: 25
+  guardrails:
+    per_bot_min_pct_of_daily_risk: 5
+    per_bot_max_pct_of_daily_risk: 25
+
+momentum_bots:
+  - bot_id: mom_AAPL
+    enabled: true
+    ticker: AAPL
+    session:
+      trade_start: "06:35"
+      trade_end: "09:30"
+      manage_until: "12:55"
+    risk:
+      max_trades_per_day: 3
+      max_concurrent_positions: 1
+    exits:
+      stop_loss_pct: 0.50
+      take_profit_pct: 1.00
+      time_stop_minutes: 25
+    signal:
+      mode: "placeholder_momentum_v1"
+      params: {}
+
+  - bot_id: mom_TSLA
+    enabled: false
+    ticker: TSLA
+    session:
+      trade_start: "06:35"
+      trade_end: "09:30"
+      manage_until: "12:55"
+    risk:
+      max_trades_per_day: 3
+      max_concurrent_positions: 1
+    exits:
+      stop_loss_pct: 0.60
+      take_profit_pct: 1.20
+      time_stop_minutes: 25
+    signal:
+      mode: "placeholder_momentum_v1"
+      params: {}
+
+optionsbot:
+  enabled: true
+  bot_id: opt_core
+  tickers: [SPY, QQQ]
+  session:
+    trade_start: "06:40"
+    trade_end: "09:50"
+    manage_until: "12:55"
+  risk:
+    max_trades_per_day: 5
+    max_concurrent_positions: 3
+  exits:
+    take_profit_pct: 0.40
+    stop_loss_pct: 0.30
+    time_stop_minutes: 180
+    flatten_before_close_minutes: 10
+  chain_rules:
+    dte_min: 7
+    dte_max: 45
+    delta_min: 0.25
+    delta_max: 0.60
+
+cryptobot:
+  enabled: true
+  bot_id: crypto_core
+  pairs: ["BTC/USD", "ETH/USD"]
+  session:
+    trade_start: "00:00"
+    trade_end: "23:59"
+    manage_until: "23:59"
+  execution:
+    order_type: limit
+    tif: gtc
+    use_notional: true
+    default_notional_usd: 50
+  risk:
+    max_trades_per_day: 6
+    max_concurrent_positions: 2
+  exits:
+    stop_loss_pct: 0.75
+    take_profit_pct: 1.50
+    time_stop_minutes: 240
+  signal:
+    mode: "placeholder_crypto_momo_v1"
+    params: {}
+```
+
+---
+
+# 4) Python packaging
+
+## `pyproject.toml`
+
+```toml
+[project]
+name = "trading_hydra_mvp"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "alpaca-py>=0.26.0",
+  "pyyaml>=6.0.1",
+  "python-dotenv>=1.0.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+```
+
+---
+
+# 5) Core modules
+
+## `src/core/state_store.py` (durable state)
+
+```python
+import json
+import sqlite3
+import threading
+from typing import Any, Optional
+
+class StateStore:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+            )
+            conn.commit()
+
+    def get(self, key: str, default: Optional[Any] = None) -> Any:
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT v FROM kv WHERE k = ?", (key,))
+            row = cur.fetchone()
+            if not row:
+                return default
+            return json.loads(row[0])
+
+    def set(self, key: str, value: Any) -> None:
+        payload = json.dumps(value)
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO kv (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (key, payload),
+            )
+            conn.commit()
+```
+
+## `src/core/logger.py` (JSONL log)
+
+```python
+import json
+from datetime import datetime
+from typing import Any, Dict
+
+class JsonlLogger:
+    def __init__(self, path: str):
+        self.path = path
+
+    def log(self, event: str, data: Dict[str, Any]) -> None:
+        rec = {"ts": datetime.utcnow().isoformat(), "event": event, **data}
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+```
+
+## `src/core/clock.py`
+
+```python
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
+class MarketClock:
+    def __init__(self, tz: str):
+        self.tz = ZoneInfo(tz)
+
+    def now_local(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def within(self, start_hhmm: str, end_hhmm: str) -> bool:
+        h1, m1 = map(int, start_hhmm.split(":"))
+        h2, m2 = map(int, end_hhmm.split(":"))
+        now = self.now_local().time()
+        return time(h1, m1) <= now <= time(h2, m2)
+```
+
+## `src/core/util.py` (fail-closed halt helpers)
+
+```python
+from datetime import datetime, timedelta
+from .state_store import StateStore
+
+def safe_halt(state: StateStore, reason: str, minutes: int = 390) -> None:
+    until = (datetime.utcnow() + timedelta(minutes=minutes)).isoformat()
+    state.set("GLOBAL_TRADING_HALT", True)
+    state.set("HALT_REASON", reason)
+    state.set("HALT_UNTIL", until)
+
+def halt_active(state: StateStore) -> bool:
+    return bool(state.get("GLOBAL_TRADING_HALT", False))
+
+def clear_halt_if_expired(state: StateStore) -> None:
+    if not halt_active(state):
+        return
+    until = state.get("HALT_UNTIL", "")
+    if not until:
+        return
+    try:
+        if datetime.utcnow() >= datetime.fromisoformat(until):
+            state.set("GLOBAL_TRADING_HALT", False)
+            state.set("HALT_REASON", "")
+            state.set("HALT_UNTIL", "")
+    except Exception:
+        return
+```

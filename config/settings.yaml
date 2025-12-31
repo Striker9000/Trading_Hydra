@@ -1,0 +1,28 @@
+system:
+  timezone: America/Los_Angeles
+  log_path: ./logs/app.jsonl
+  state_db_path: ./state/trading_state.db
+
+runner:
+  loop_interval_seconds: 5
+
+safety:
+  fail_closed: true
+  allow_budget_fallback: false
+  global_cooldown_minutes: 390
+
+risk:
+  global_max_daily_loss_pct: 2.0  # Increased for meaningful budgets
+  max_orders_per_minute: 10
+  
+development:
+  # Mock data settings for after-hours development
+  enable_mock_data: true
+  mock_market_hours: false  # Set to true to simulate market hours
+  mock_price_movement: true
+  enhanced_logging: true
+
+health:
+  max_price_staleness_seconds: 15
+  max_api_failures_in_window: 5
+  api_failure_window_seconds: 60

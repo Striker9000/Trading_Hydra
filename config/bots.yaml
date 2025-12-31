@@ -1,0 +1,131 @@
+exitbot:
+  enabled: true
+  cooloff_minutes: 390
+  kill_conditions:
+    api_failure_halt: true
+    data_stale_halt: true
+    max_daily_loss_halt: true
+    anomaly_halt: true
+
+portfoliobot:
+  enabled: true
+  cash_reserve_pct: 30
+  buckets:
+    momentum_bucket_pct_of_daily_risk: 25
+    options_bucket_pct_of_daily_risk: 50
+    crypto_bucket_pct_of_daily_risk: 25
+  guardrails:
+    per_bot_min_pct_of_daily_risk: 5
+    per_bot_max_pct_of_daily_risk: 25
+
+momentum_bots:
+  - bot_id: mom_AAPL
+    enabled: true
+    ticker: AAPL
+    session:
+      trade_start: "06:35"
+      trade_end: "09:30"
+      manage_until: "12:55"
+    risk:
+      max_trades_per_day: 3
+      max_concurrent_positions: 1
+    exits:
+      stop_loss_pct: 0.50
+      take_profit_pct: 1.00
+      time_stop_minutes: 25
+    signal:
+      mode: "placeholder_momentum_v1"
+      params: {}
+
+  - bot_id: mom_TSLA
+    enabled: false
+    ticker: TSLA
+    session:
+      trade_start: "06:35"
+      trade_end: "09:30"
+      manage_until: "12:55"
+    risk:
+      max_trades_per_day: 3
+      max_concurrent_positions: 1
+    exits:
+      stop_loss_pct: 0.60
+      take_profit_pct: 1.20
+      time_stop_minutes: 25
+    signal:
+      mode: "placeholder_momentum_v1"
+      params: {}
+
+optionsbot:
+  enabled: true
+  bot_id: opt_core
+  tickers: [SPY, QQQ, IWM]
+  session:
+    trade_start: "06:40"    # PST: 9:40 AM EST
+    trade_end: "12:30"      # PST: 3:30 PM EST (30min before close)
+    manage_until: "13:00"   # PST: 4:00 PM EST
+  risk:
+    max_trades_per_day: 3
+    max_concurrent_positions: 3
+    max_position_size_usd: 500
+    profit_target_usd: 100   # Target $100 per trade
+  strategies:
+    bull_put_spread:
+      enabled: true
+      min_credit: 0.50
+      max_credit: 3.00
+      profit_target: 0.50    # 50% of credit
+      max_dte: 45
+    bear_call_spread:
+      enabled: true
+      min_credit: 0.50
+      max_credit: 3.00
+      profit_target: 0.50
+      max_dte: 45
+    iron_condor:
+      enabled: false         # Disable for now - more complex
+      min_credit: 1.00
+      max_credit: 4.00
+      profit_target: 0.25
+      max_dte: 60
+    straddle:
+      enabled: false         # Disable for now - requires volatility analysis
+      max_cost: 10.00
+      profit_target: 0.30
+  exits:
+    take_profit_pct: 50      # 50% profit target
+    stop_loss_pct: 200       # 200% loss (full spread width)
+    time_stop_minutes: 240   # 4 hours max hold
+    flatten_before_close_minutes: 30
+  chain_rules:
+    dte_min: 7
+    dte_max: 60
+    delta_min: 0.10
+    delta_max: 0.70
+    min_volume: 50
+    min_open_interest: 100
+
+cryptobot:
+  enabled: true
+  bot_id: "crypto_core"
+  pairs: ["BTC/USD", "ETH/USD"]
+  session:
+    trade_start: "00:00"
+    trade_end: "23:59"
+    manage_until: "23:59"
+  execution:
+    order_type: limit
+    tif: gtc
+    use_notional: true
+    default_notional_usd: 50
+    min_notional_usd: 10  # Alpaca minimum for crypto
+  risk:
+    max_trades_per_day: 5
+    max_concurrent_positions: 3
+    min_order_size: 15.0  # Above Alpaca's $10 minimum with buffer
+  exits:
+    stop_loss_pct: 0.75
+    take_profit_pct: 1.50
+    time_stop_minutes: 240
+  signal:
+    mode: "placeholder_crypto_momo_v1"
+    params: {}

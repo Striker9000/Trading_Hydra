@@ -1,0 +1,1141 @@
+Alright Ty... here’s a **full MVP kit** that includes **all execution bots** (MomentumBots + OptionsBot + CryptoBot) plus **ExitBot + PortfolioBot**, using **alpaca-py** behind a broker adapter... with **fail-closed safety** and **file-backed state** so power loss doesn’t wipe you.
+
+Then I’ll give you a **Replit build prompt** you can paste to make it start generating the repo.
+
+No fluff... straight blueprint.
+
+---
+
+# 1) MVP System Goals
+
+This MVP must do these things on day 1...
+
+* Run on **one Alpaca account** (paper first)
+* Fail closed... meaning if something breaks, it halts trading
+* Log everything (JSONL)
+* Store state durably (SQLite file)
+* Run all execution bots every loop, but only trade if preflight passes
+* Let you deploy multiple MomentumBots per ticker from config
+* OptionsBot and CryptoBot exist and run, but strategy logic starts as placeholder until you paste your edge
+
+---
+
+# 2) Repo scaffolding
+
+```
+trading_hydra_mvp/
+  .env.example
+  pyproject.toml
+  README.md
+
+  config/
+    settings.yaml
+    bots.yaml
+
+  state/
+    trading_state.db
+
+  logs/
+    app.jsonl
+
+  src/
+    core/
+      broker.py
+      alpaca_broker.py
+      state_store.py
+      logger.py
+      clock.py
+      util.py
+      health.py
+      risk.py
+
+    bots/
+      exitbot.py
+      portfoliobot.py
+      momentumbot.py
+      optionsbot.py
+      cryptobot.py
+
+    runner/
+      main.py
+      bootstrap.py
+      scheduler.py
+
+    tools/
+      analyst_prompt.txt
+
+  tests/
+    test_preflight.py
+    test_state_store.py
+```
+
+---
+
+# 3) Configs
+
+## `.env.example`
+
+```bash
+ALPACA_KEY="YOUR_KEY"
+ALPACA_SECRET="YOUR_SECRET"
+ALPACA_PAPER="true"
+```
+
+## `config/settings.yaml`
+
+```yaml
+system:
+  timezone: America/Los_Angeles
+  log_path: ./logs/app.jsonl
+  state_db_path: ./state/trading_state.db
+
+runner:
+  loop_interval_seconds: 5
+
+safety:
+  fail_closed: true
+  allow_budget_fallback: false
+  global_cooldown_minutes: 390
+
+risk:
+  global_max_daily_loss_pct: 1.0
+  max_orders_per_minute: 10
+
+health:
+  max_price_staleness_seconds: 15
+  max_api_failures_in_window: 5
+  api_failure_window_seconds: 60
+```
+
+## `config/bots.yaml`
+
+```yaml
+exitbot:
+  enabled: true
+  cooloff_minutes: 390
+  kill_conditions:
+    api_failure_halt: true
+    data_stale_halt: true
+    max_daily_loss_halt: true
+    anomaly_halt: true
+
+portfoliobot:
+  enabled: true
+  cash_reserve_pct: 30
+  buckets:
+    momentum_bucket_pct_of_daily_risk: 25
+    options_bucket_pct_of_daily_risk: 50
+    crypto_bucket_pct_of_daily_risk: 25
+  guardrails:
+    per_bot_min_pct_of_daily_risk: 5
+    per_bot_max_pct_of_daily_risk: 25
+
+momentum_bots:
+  - bot_id: mom_AAPL
+    enabled: true
+    ticker: AAPL
+    session:
+      trade_start: "06:35"
+      trade_end: "09:30"
+      manage_until: "12:55"
+    risk:
+      max_trades_per_day: 3
+      max_concurrent_positions: 1
+    exits:
+      stop_loss_pct: 0.50
+      take_profit_pct: 1.00
+      time_stop_minutes: 25
+    signal:
+      mode: "placeholder_momentum_v1"
+      params: {}
+
+  - bot_id: mom_TSLA
+    enabled: false
+    ticker: TSLA
+    session:
+      trade_start: "06:35"
+      trade_end: "09:30"
+      manage_until: "12:55"
+    risk:
+      max_trades_per_day: 3
+      max_concurrent_positions: 1
+    exits:
+      stop_loss_pct: 0.60
+      take_profit_pct: 1.20
+      time_stop_minutes: 25
+    signal:
+      mode: "placeholder_momentum_v1"
+      params: {}
+
+optionsbot:
+  enabled: true
+  bot_id: opt_core
+  tickers: [SPY, QQQ]
+  session:
+    trade_start: "06:40"
+    trade_end: "09:50"
+    manage_until: "12:55"
+  risk:
+    max_trades_per_day: 5
+    max_concurrent_positions: 3
+  exits:
+    take_profit_pct: 0.40
+    stop_loss_pct: 0.30
+    time_stop_minutes: 180
+    flatten_before_close_minutes: 10
+  chain_rules:
+    dte_min: 7
+    dte_max: 45
+    delta_min: 0.25
+    delta_max: 0.60
+
+cryptobot:
+  enabled: true
+  bot_id: crypto_core
+  pairs: ["BTC/USD", "ETH/USD"]
+  session:
+    trade_start: "00:00"
+    trade_end: "23:59"
+    manage_until: "23:59"
+  execution:
+    order_type: limit
+    tif: gtc
+    use_notional: true
+    default_notional_usd: 50
+  risk:
+    max_trades_per_day: 6
+    max_concurrent_positions: 2
+  exits:
+    stop_loss_pct: 0.75
+    take_profit_pct: 1.50
+    time_stop_minutes: 240
+  signal:
+    mode: "placeholder_crypto_momo_v1"
+    params: {}
+```
+
+---
+
+# 4) Python packaging
+
+## `pyproject.toml`
+
+```toml
+[project]
+name = "trading_hydra_mvp"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "alpaca-py>=0.26.0",
+  "pyyaml>=6.0.1",
+  "python-dotenv>=1.0.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+```
+
+---
+
+# 5) Core modules
+
+## `src/core/state_store.py` (durable state)
+
+```python
+import json
+import sqlite3
+import threading
+from typing import Any, Optional
+
+class StateStore:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+            )
+            conn.commit()
+
+    def get(self, key: str, default: Optional[Any] = None) -> Any:
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT v FROM kv WHERE k = ?", (key,))
+            row = cur.fetchone()
+            if not row:
+                return default
+            return json.loads(row[0])
+
+    def set(self, key: str, value: Any) -> None:
+        payload = json.dumps(value)
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO kv (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (key, payload),
+            )
+            conn.commit()
+```
+
+## `src/core/logger.py` (JSONL log)
+
+```python
+import json
+from datetime import datetime
+from typing import Any, Dict
+
+class JsonlLogger:
+    def __init__(self, path: str):
+        self.path = path
+
+    def log(self, event: str, data: Dict[str, Any]) -> None:
+        rec = {"ts": datetime.utcnow().isoformat(), "event": event, **data}
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+```
+
+## `src/core/clock.py`
+
+```python
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
+class MarketClock:
+    def __init__(self, tz: str):
+        self.tz = ZoneInfo(tz)
+
+    def now_local(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def within(self, start_hhmm: str, end_hhmm: str) -> bool:
+        h1, m1 = map(int, start_hhmm.split(":"))
+        h2, m2 = map(int, end_hhmm.split(":"))
+        now = self.now_local().time()
+        return time(h1, m1) <= now <= time(h2, m2)
+```
+
+## `src/core/util.py` (fail-closed halt helpers)
+
+```python
+from datetime import datetime, timedelta
+from .state_store import StateStore
+
+def safe_halt(state: StateStore, reason: str, minutes: int = 390) -> None:
+    until = (datetime.utcnow() + timedelta(minutes=minutes)).isoformat()
+    state.set("GLOBAL_TRADING_HALT", True)
+    state.set("HALT_REASON", reason)
+    state.set("HALT_UNTIL", until)
+
+def halt_active(state: StateStore) -> bool:
+    return bool(state.get("GLOBAL_TRADING_HALT", False))
+
+def clear_halt_if_expired(state: StateStore) -> None:
+    if not halt_active(state):
+        return
+    until = state.get("HALT_UNTIL", "")
+    if not until:
+        return
+    try:
+        if datetime.utcnow() >= datetime.fromisoformat(until):
+            state.set("GLOBAL_TRADING_HALT", False)
+            state.set("HALT_REASON", "")
+            state.set("HALT_UNTIL", "")
+    except Exception:
+        return
+```
+
+## `src/core/risk.py`
+
+```python
+def dollars_from_pct(equity: float, pct: float) -> float:
+    return max(0.0, equity * (pct / 100.0))
+
+def valid_budget(x) -> bool:
+    return x is not None and isinstance(x, (int, float)) and x > 0 and x < 1e12
+```
+
+## `src/core/health.py` (minimal)
+
+```python
+from datetime import datetime
+from .state_store import StateStore
+
+class HealthMonitor:
+    def __init__(self, state: StateStore, max_price_stale_s: int, max_api_failures: int, window_s: int):
+        self.state = state
+        self.max_price_stale_s = max_price_stale_s
+        self.max_api_failures = max_api_failures
+        self.window_s = window_s
+
+    def record_price_tick(self) -> None:
+        self.state.set("health.last_price_ts", datetime.utcnow().isoformat())
+
+    def record_api_failure(self) -> None:
+        key = "health.api_failures"
+        failures = self.state.get(key, [])
+        now = datetime.utcnow()
+        failures = [t for t in failures if (now - datetime.fromisoformat(t)).total_seconds() <= self.window_s]
+        failures.append(now.isoformat())
+        self.state.set(key, failures)
+
+    def snapshot_ok(self) -> (bool, str):
+        now = datetime.utcnow()
+        last_ts = self.state.get("health.last_price_ts", None)
+        failures = self.state.get("health.api_failures", [])
+
+        if last_ts:
+            age = (now - datetime.fromisoformat(last_ts)).total_seconds()
+            if age > self.max_price_stale_s:
+                return False, f"stale price data {age:.1f}s"
+
+        failures = [t for t in failures if (now - datetime.fromisoformat(t)).total_seconds() <= self.window_s]
+        if len(failures) >= self.max_api_failures:
+            return False, f"api failures {len(failures)} in window"
+
+        return True, "ok"
+```
+
+---
+
+# 6) Broker interface and Alpaca adapter
+
+## `src/core/broker.py`
+
+```python
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+
+class Broker(ABC):
+    @abstractmethod
+    def get_account(self) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    def list_positions(self) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def cancel_all_orders(self) -> None: ...
+
+    @abstractmethod
+    def close_all_positions(self) -> None: ...
+
+    @abstractmethod
+    def get_price(self, symbol: str) -> float: ...
+
+    @abstractmethod
+    def place_order(self, payload: Dict[str, Any]) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    def get_options_chain(self, ticker: str) -> List[Dict[str, Any]]: ...
+```
+
+## `src/core/alpaca_broker.py`
+
+This is MVP... enough to trade stocks and crypto with market or limit orders... options chain stays placeholder until you wire it.
+
+```python
+import os
+from typing import Any, Dict, List
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest, CryptoLatestTradeRequest
+
+from .broker import Broker
+
+class AlpacaBroker(Broker):
+    def __init__(self):
+        key = os.getenv("ALPACA_KEY", "")
+        secret = os.getenv("ALPACA_SECRET", "")
+        paper = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+
+        self.trading = TradingClient(key, secret, paper=paper)
+        self.stock_data = StockHistoricalDataClient(key, secret)
+        self.crypto_data = CryptoHistoricalDataClient(key, secret)
+
+    def get_account(self) -> Dict[str, Any]:
+        return self.trading.get_account().model_dump()
+
+    def list_positions(self) -> List[Dict[str, Any]]:
+        return [p.model_dump() for p in self.trading.get_all_positions()]
+
+    def cancel_all_orders(self) -> None:
+        self.trading.cancel_orders()
+
+    def close_all_positions(self) -> None:
+        self.trading.close_all_positions()
+
+    def get_price(self, symbol: str) -> float:
+        if "/" in symbol:
+            req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
+            resp = self.crypto_data.get_crypto_latest_trade(req)
+            return float(resp[symbol].price)
+        req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+        resp = self.stock_data.get_stock_latest_trade(req)
+        return float(resp[symbol].price)
+
+    def place_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        kind = payload["type"]
+        side = OrderSide.BUY if payload["side"] == "buy" else OrderSide.SELL
+        tif = TimeInForce(payload.get("tif", "gtc"))
+
+        if kind == "market":
+            req = MarketOrderRequest(
+                symbol=payload["symbol"],
+                side=side,
+                time_in_force=tif,
+                qty=payload.get("qty"),
+                notional=payload.get("notional"),
+            )
+        else:
+            req = LimitOrderRequest(
+                symbol=payload["symbol"],
+                side=side,
+                time_in_force=tif,
+                limit_price=float(payload["limit_price"]),
+                qty=payload.get("qty"),
+                notional=payload.get("notional"),
+            )
+
+        order = self.trading.submit_order(req)
+        return order.model_dump()
+
+    def get_options_chain(self, ticker: str) -> List[Dict[str, Any]]:
+        return []
+```
+
+---
+
+# 7) Bot logic
+
+## Shared preflight doctrine (all execution bots)
+
+Execution bots must not enter trades unless:
+
+* ExitBot has not halted trading
+* Bot enabled
+* Bot allowed
+* Budgets exist and valid
+* Within trade window (crypto is 24/7 by config)
+* Health is ok (optional but recommended)
+
+Each bot runs `manage_open_positions()` no matter what... then only enters new trades if allowed.
+
+---
+
+## `src/bots/exitbot.py` (kill switch, rank 100)
+
+```python
+from datetime import datetime
+from typing import Any, Dict
+from ..core.state_store import StateStore
+from ..core.logger import JsonlLogger
+from ..core.health import HealthMonitor
+from ..core.risk import dollars_from_pct
+from ..core.util import safe_halt, clear_halt_if_expired
+from ..core.broker import Broker
+
+class ExitBot:
+    rank = 100
+
+    def __init__(self, broker: Broker, state: StateStore, logger: JsonlLogger, health: HealthMonitor, cfg: Dict[str, Any], settings: Dict[str, Any]):
+        self.broker = broker
+        self.state = state
+        self.log = logger
+        self.health = health
+        self.cfg = cfg
+        self.settings = settings
+
+    def run_once(self) -> None:
+        if not self.cfg.get("enabled", True):
+            return
+
+        clear_halt_if_expired(self.state)
+
+        ok, reason = self.health.snapshot_ok()
+        if not ok and self.cfg["kill_conditions"].get("api_failure_halt", True):
+            safe_halt(self.state, f"HEALTH_FAIL... {reason}", self.cfg.get("cooloff_minutes", 390))
+            self.flatten(f"HEALTH_FAIL... {reason}")
+            return
+
+        acct = self.broker.get_account()
+        equity = float(acct.get("equity", 0.0))
+        day_start = float(self.state.get("day_start_equity", equity))
+        pnl = equity - day_start
+
+        max_loss = dollars_from_pct(day_start, self.settings["risk"]["global_max_daily_loss_pct"])
+        if pnl <= -max_loss and self.cfg["kill_conditions"].get("max_daily_loss_halt", True):
+            safe_halt(self.state, f"MAX_DAILY_LOSS... pnl={pnl:.2f} <= -{max_loss:.2f}", self.cfg.get("cooloff_minutes", 390))
+            self.flatten("MAX_DAILY_LOSS")
+            return
+
+        self.log.log("exitbot_ok", {"equity": equity, "day_start_equity": day_start, "pnl": pnl})
+
+    def flatten(self, reason: str) -> None:
+        try:
+            self.broker.cancel_all_orders()
+        except Exception as e:
+            self.health.record_api_failure()
+
+        try:
+            self.broker.close_all_positions()
+        except Exception as e:
+            self.health.record_api_failure()
+
+        self.log.log("exitbot_flatten", {"reason": reason})
+```
+
+## `src/bots/portfoliobot.py` (budgets, rank 90)
+
+```python
+from typing import Any, Dict, List
+from ..core.state_store import StateStore
+from ..core.logger import JsonlLogger
+from ..core.risk import dollars_from_pct
+from ..core.broker import Broker
+
+class PortfolioBot:
+    rank = 90
+
+    def __init__(self, broker: Broker, state: StateStore, logger: JsonlLogger, cfg: Dict[str, Any], settings: Dict[str, Any], bots_cfg: Dict[str, Any]):
+        self.broker = broker
+        self.state = state
+        self.log = logger
+        self.cfg = cfg
+        self.settings = settings
+        self.bots_cfg = bots_cfg
+
+    def run_once(self) -> None:
+        if not self.cfg.get("enabled", True):
+            return
+
+        acct = self.broker.get_account()
+        equity = float(acct.get("equity", 0.0))
+        day_start = float(self.state.get("day_start_equity", equity))
+        daily_risk = dollars_from_pct(day_start, self.settings["risk"]["global_max_daily_loss_pct"])
+
+        buckets = self.cfg["buckets"]
+        mom_bucket = daily_risk * (buckets["momentum_bucket_pct_of_daily_risk"] / 100.0)
+        opt_bucket = daily_risk * (buckets["options_bucket_pct_of_daily_risk"] / 100.0)
+        cry_bucket = daily_risk * (buckets["crypto_bucket_pct_of_daily_risk"] / 100.0)
+
+        guard = self.cfg["guardrails"]
+        per_min = daily_risk * (guard["per_bot_min_pct_of_daily_risk"] / 100.0)
+        per_max = daily_risk * (guard["per_bot_max_pct_of_daily_risk"] / 100.0)
+
+        moms = [b for b in self.bots_cfg.get("momentum_bots", []) if b.get("enabled", True)]
+        n = max(1, len(moms))
+        mom_each = max(per_min, min(per_max, mom_bucket / n))
+
+        for b in moms:
+            bot_id = b["bot_id"]
+            self.state.set(f"budgets.{bot_id}.max_daily_loss", mom_each)
+            self.state.set(f"budgets.{bot_id}.max_open_risk", mom_each * 2)
+            self.state.set(f"budgets.{bot_id}.max_trades_per_day", int(b["risk"]["max_trades_per_day"]))
+            self.state.set(f"budgets.{bot_id}.max_concurrent_positions", int(b["risk"]["max_concurrent_positions"]))
+            self.state.set(f"bots.{bot_id}.allowed", True)
+            self.state.set(f"bots.{bot_id}.enabled", bool(b.get("enabled", True)))
+
+        opt = self.bots_cfg.get("optionsbot", {})
+        if opt.get("enabled", False):
+            bot_id = opt["bot_id"]
+            self.state.set(f"budgets.{bot_id}.max_daily_loss", opt_bucket)
+            self.state.set(f"budgets.{bot_id}.max_open_risk", opt_bucket * 2)
+            self.state.set(f"budgets.{bot_id}.max_trades_per_day", int(opt["risk"]["max_trades_per_day"]))
+            self.state.set(f"budgets.{bot_id}.max_concurrent_positions", int(opt["risk"]["max_concurrent_positions"]))
+            self.state.set(f"bots.{bot_id}.allowed", True)
+            self.state.set(f"bots.{bot_id}.enabled", True)
+
+        cry = self.bots_cfg.get("cryptobot", {})
+        if cry.get("enabled", False):
+            bot_id = cry["bot_id"]
+            self.state.set(f"budgets.{bot_id}.max_daily_loss", cry_bucket)
+            self.state.set(f"budgets.{bot_id}.max_open_risk", cry_bucket * 2)
+            self.state.set(f"budgets.{bot_id}.max_trades_per_day", int(cry["risk"]["max_trades_per_day"]))
+            self.state.set(f"budgets.{bot_id}.max_concurrent_positions", int(cry["risk"]["max_concurrent_positions"]))
+            self.state.set(f"bots.{bot_id}.allowed", True)
+            self.state.set(f"bots.{bot_id}.enabled", True)
+
+        self.log.log("portfoliobot_budgets", {
+            "equity": equity,
+            "day_start_equity": day_start,
+            "daily_risk": daily_risk,
+            "mom_bucket": mom_bucket,
+            "opt_bucket": opt_bucket,
+            "cry_bucket": cry_bucket,
+            "mom_each": mom_each,
+        })
+```
+
+## `src/bots/momentumbot.py` (execution bot)
+
+```python
+from typing import Any, Dict
+from ..core.state_store import StateStore
+from ..core.logger import JsonlLogger
+from ..core.clock import MarketClock
+from ..core.util import halt_active
+from ..core.risk import valid_budget
+from ..core.broker import Broker
+
+class MomentumBot:
+    rank = 20
+
+    def __init__(self, bot_def: Dict[str, Any], broker: Broker, state: StateStore, logger: JsonlLogger, clock: MarketClock):
+        self.cfg = bot_def
+        self.bot_id = bot_def["bot_id"]
+        self.ticker = bot_def["ticker"]
+        self.broker = broker
+        self.state = state
+        self.log = logger
+        self.clock = clock
+
+    def manage_open_positions(self) -> None:
+        return
+
+    def trade_allowed(self) -> (bool, str):
+        if halt_active(self.state):
+            return False, "global halt"
+        if not bool(self.state.get(f"bots.{self.bot_id}.enabled", self.cfg.get("enabled", True))):
+            return False, "disabled"
+        if not bool(self.state.get(f"bots.{self.bot_id}.allowed", True)):
+            return False, "disallowed"
+
+        max_daily = self.state.get(f"budgets.{self.bot_id}.max_daily_loss", None)
+        max_open = self.state.get(f"budgets.{self.bot_id}.max_open_risk", None)
+        if not (valid_budget(max_daily) and valid_budget(max_open)):
+            return False, "missing budgets"
+
+        sess = self.cfg["session"]
+        if not self.clock.within(sess["trade_start"], sess["trade_end"]):
+            return False, "outside trade window"
+
+        return True, "ok"
+
+    def compute_signal(self, price: float) -> str:
+        return "none"
+
+    def run_once(self) -> None:
+        self.manage_open_positions()
+
+        ok, reason = self.trade_allowed()
+        price = float(self.broker.get_price(self.ticker))
+
+        if not ok:
+            self.log.log("momentum_manage_only", {"bot_id": self.bot_id, "ticker": self.ticker, "price": price, "reason": reason})
+            return
+
+        sig = self.compute_signal(price)
+        self.log.log("momentum_signal", {"bot_id": self.bot_id, "ticker": self.ticker, "price": price, "signal": sig})
+
+        # MVP... no actual entries yet
+        # You will paste your entry logic here and enforce budgets before placing orders
+```
+
+## `src/bots/optionsbot.py` (execution bot, placeholder strategy)
+
+```python
+from typing import Any, Dict, List
+from ..core.state_store import StateStore
+from ..core.logger import JsonlLogger
+from ..core.clock import MarketClock
+from ..core.util import halt_active
+from ..core.risk import valid_budget
+from ..core.broker import Broker
+
+class OptionsBot:
+    rank = 30
+
+    def __init__(self, bot_def: Dict[str, Any], broker: Broker, state: StateStore, logger: JsonlLogger, clock: MarketClock):
+        self.cfg = bot_def
+        self.bot_id = bot_def["bot_id"]
+        self.tickers = bot_def["tickers"]
+        self.broker = broker
+        self.state = state
+        self.log = logger
+        self.clock = clock
+
+    def manage_open_positions(self) -> None:
+        return
+
+    def trade_allowed(self) -> (bool, str):
+        if halt_active(self.state):
+            return False, "global halt"
+        if not bool(self.state.get(f"bots.{self.bot_id}.enabled", self.cfg.get("enabled", True))):
+            return False, "disabled"
+        if not bool(self.state.get(f"bots.{self.bot_id}.allowed", True)):
+            return False, "disallowed"
+
+        max_daily = self.state.get(f"budgets.{self.bot_id}.max_daily_loss", None)
+        max_open = self.state.get(f"budgets.{self.bot_id}.max_open_risk", None)
+        if not (valid_budget(max_daily) and valid_budget(max_open)):
+            return False, "missing budgets"
+
+        sess = self.cfg["session"]
+        if not self.clock.within(sess["trade_start"], sess["trade_end"]):
+            return False, "outside trade window"
+
+        return True, "ok"
+
+    def run_once(self) -> None:
+        self.manage_open_positions()
+
+        ok, reason = self.trade_allowed()
+        if not ok:
+            self.log.log("options_manage_only", {"bot_id": self.bot_id, "reason": reason})
+            return
+
+        # MVP... chain not wired yet
+        self.log.log("options_placeholder", {"bot_id": self.bot_id, "tickers": self.tickers, "note": "wire options chain + strategy next"})
+```
+
+## `src/bots/cryptobot.py` (execution bot, simplest entry style)
+
+```python
+from typing import Any, Dict
+from ..core.state_store import StateStore
+from ..core.logger import JsonlLogger
+from ..core.clock import MarketClock
+from ..core.util import halt_active
+from ..core.risk import valid_budget
+from ..core.broker import Broker
+
+class CryptoBot:
+    rank = 25
+
+    def __init__(self, bot_def: Dict[str, Any], broker: Broker, state: StateStore, logger: JsonlLogger, clock: MarketClock):
+        self.cfg = bot_def
+        self.bot_id = bot_def["bot_id"]
+        self.pairs = bot_def["pairs"]
+        self.broker = broker
+        self.state = state
+        self.log = logger
+        self.clock = clock
+
+    def manage_open_positions(self) -> None:
+        return
+
+    def trade_allowed(self) -> (bool, str):
+        if halt_active(self.state):
+            return False, "global halt"
+        if not bool(self.state.get(f"bots.{self.bot_id}.enabled", self.cfg.get("enabled", True))):
+            return False, "disabled"
+        if not bool(self.state.get(f"bots.{self.bot_id}.allowed", True)):
+            return False, "disallowed"
+
+        max_daily = self.state.get(f"budgets.{self.bot_id}.max_daily_loss", None)
+        max_open = self.state.get(f"budgets.{self.bot_id}.max_open_risk", None)
+        if not (valid_budget(max_daily) and valid_budget(max_open)):
+            return False, "missing budgets"
+
+        sess = self.cfg["session"]
+        if not self.clock.within(sess["trade_start"], sess["trade_end"]):
+            return False, "outside trade window"
+
+        return True, "ok"
+
+    def compute_signal(self, pair: str, price: float) -> str:
+        return "none"
+
+    def run_once(self) -> None:
+        self.manage_open_positions()
+
+        ok, reason = self.trade_allowed()
+        for pair in self.pairs:
+            price = float(self.broker.get_price(pair))
+            if not ok:
+                self.log.log("crypto_manage_only", {"bot_id": self.bot_id, "pair": pair, "price": price, "reason": reason})
+                continue
+
+            sig = self.compute_signal(pair, price)
+            self.log.log("crypto_signal", {"bot_id": self.bot_id, "pair": pair, "price": price, "signal": sig})
+
+            # MVP... no entries yet
+            # Next step... add a simple notional buy/sell rule and enforce max_trades_per_day
+```
+
+---
+
+# 8) Runner
+
+## `src/runner/bootstrap.py`
+
+```python
+from datetime import datetime
+from ..core.state_store import StateStore
+from ..core.broker import Broker
+from ..core.util import safe_halt
+
+def bootstrap_daily(state: StateStore, broker: Broker) -> None:
+    today = datetime.utcnow().date().isoformat()
+    last = state.get("day_key", "")
+
+    if last != today:
+        acct = broker.get_account()
+        equity = float(acct.get("equity", 0.0))
+        state.set("day_key", today)
+        state.set("day_start_equity", equity)
+
+        # daily reset counters live here later
+        state.set("health.api_failures", [])
+        state.set("health.last_price_ts", None)
+
+        # default to not halted
+        state.set("GLOBAL_TRADING_HALT", False)
+        state.set("HALT_REASON", "")
+        state.set("HALT_UNTIL", "")
+```
+
+## `src/runner/scheduler.py`
+
+```python
+import time
+from typing import Callable
+
+class SimpleScheduler:
+    def __init__(self, interval_seconds: int):
+        self.interval = interval_seconds
+
+    def run_forever(self, tick: Callable[[], None]) -> None:
+        while True:
+            tick()
+            time.sleep(self.interval)
+```
+
+## `src/runner/main.py` (fail-closed wrapper)
+
+```python
+import os
+import yaml
+from dotenv import load_dotenv
+
+from ..core.state_store import StateStore
+from ..core.logger import JsonlLogger
+from ..core.clock import MarketClock
+from ..core.health import HealthMonitor
+from ..core.util import safe_halt
+
+from ..core.alpaca_broker import AlpacaBroker
+from ..bots.exitbot import ExitBot
+from ..bots.portfoliobot import PortfolioBot
+from ..bots.momentumbot import MomentumBot
+from ..bots.optionsbot import OptionsBot
+from ..bots.cryptobot import CryptoBot
+
+from .bootstrap import bootstrap_daily
+from .scheduler import SimpleScheduler
+
+def load_yaml(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def main():
+    load_dotenv()
+
+    settings = load_yaml("./config/settings.yaml")
+    bots_cfg = load_yaml("./config/bots.yaml")
+
+    state = StateStore(settings["system"]["state_db_path"])
+    logger = JsonlLogger(settings["system"]["log_path"])
+    clock = MarketClock(settings["system"]["timezone"])
+    broker = AlpacaBroker()
+
+    health = HealthMonitor(
+        state=state,
+        max_price_stale_s=settings["health"]["max_price_staleness_seconds"],
+        max_api_failures=settings["health"]["max_api_failures_in_window"],
+        window_s=settings["health"]["api_failure_window_seconds"],
+    )
+
+    exit_bot = ExitBot(broker, state, logger, health, bots_cfg["exitbot"], settings)
+    portfolio_bot = PortfolioBot(broker, state, logger, bots_cfg["portfoliobot"], settings, bots_cfg)
+
+    options_bot = OptionsBot(bots_cfg["optionsbot"], broker, state, logger, clock)
+    crypto_bot = CryptoBot(bots_cfg["cryptobot"], broker, state, logger, clock)
+
+    momentum_bots = [MomentumBot(m, broker, state, logger, clock) for m in bots_cfg.get("momentum_bots", [])]
+
+    def tick():
+        try:
+            bootstrap_daily(state, broker)
+        except Exception as e:
+            safe_halt(state, f"BOOTSTRAP_FAIL... {e}", settings["safety"]["global_cooldown_minutes"])
+            logger.log("system_halt", {"reason": f"BOOTSTRAP_FAIL... {e}"})
+            return
+
+        try:
+            exit_bot.run_once()
+        except Exception as e:
+            safe_halt(state, f"EXITBOT_FAIL... {e}", settings["safety"]["global_cooldown_minutes"])
+            logger.log("system_halt", {"reason": f"EXITBOT_FAIL... {e}"})
+            try:
+                broker.cancel_all_orders()
+                broker.close_all_positions()
+            except Exception:
+                pass
+            return
+
+        try:
+            portfolio_bot.run_once()
+        except Exception as e:
+            # fail closed... if budgets are missing, exec bots will refuse to trade anyway
+            logger.log("portfoliobot_error", {"error": str(e)})
+
+        # Execution bots... manage-only if gated
+        try:
+            crypto_bot.run_once()
+        except Exception as e:
+            logger.log("cryptobot_error", {"error": str(e)})
+
+        try:
+            options_bot.run_once()
+        except Exception as e:
+            logger.log("optionsbot_error", {"error": str(e)})
+
+        for mb in momentum_bots:
+            try:
+                mb.run_once()
+            except Exception as e:
+                logger.log("momentumbot_error", {"bot_id": mb.bot_id, "error": str(e)})
+
+    sched = SimpleScheduler(settings["runner"]["loop_interval_seconds"])
+    sched.run_forever(tick)
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+# 9) Analyst prompt (safe... audit only)
+
+## `src/tools/analyst_prompt.txt`
+
+```text
+You are a trade operations auditor... not a trader.
+
+You cannot recommend entering trades or changing live orders.
+You only audit bot behavior from logs and state snapshots.
+
+Output:
+1) rule violations
+2) risk budget violations
+3) execution quality issues (spread, slippage, order spam)
+4) health issues (stale prices, api failures)
+5) suggested parameter tweaks for paper trading only
+
+Always cite exact timestamps and log fields used.
+If data is missing... state what is missing and why it matters.
+```
+
+---
+
+# 10) README quickstart
+
+## `README.md` (minimum)
+
+```md
+## trading_hydra_mvp
+
+### Setup
+1) Copy `.env.example` to `.env` and fill Alpaca keys
+2) Install deps: `pip install -e .`
+3) Run: `python -m src.runner.main`
+
+### Safety
+- System fails closed
+- ExitBot runs first
+- If critical errors happen... GLOBAL_TRADING_HALT is set and positions are flattened
+```
+
+---
+
+# 11) What this MVP does right now
+
+This MVP boots, connects, writes logs, budgets, and runs all bots.
+
+But your execution bots are intentionally “safe placeholders” until you add the real entry logic.
+
+That’s on purpose... because the biggest risk is a half-baked strategy firing real orders.
+
+---
+
+# 12) Replit.com prompt to start building it
+
+Paste this into Replit AI exactly...
+
+```text
+Build a Python repo named trading_hydra_mvp with the following requirements...
+
+Goal...
+Create a fail-closed multi-bot trading system for a single Alpaca account using alpaca-py.
+Bots...
+ExitBot (kill switch), PortfolioBot (risk allocator), MomentumBots (multi-instance), OptionsBot, CryptoBot.
+Safety...
+Fail closed... trading disabled if any critical uncertainty. ExitBot runs first every tick.
+Durable state...
+Use SQLite key/value store at ./state/trading_state.db.
+Logging...
+Write JSONL logs to ./logs/app.jsonl.
+
+Create this folder structure...
+trading_hydra_mvp/
+  .env.example
+  pyproject.toml
+  README.md
+  config/settings.yaml
+  config/bots.yaml
+  state/trading_state.db (created at runtime)
+  logs/app.jsonl (created at runtime)
+  src/core/*.py
+  src/bots/*.py
+  src/runner/*.py
+  src/tools/analyst_prompt.txt
+  tests/*.py
+
+Dependencies...
+alpaca-py, pyyaml, python-dotenv.
+
+Implement code...
+Use the exact modules and code skeleton below and ensure imports work on Replit.
+Main entry...
+`python -m src.runner.main`
+
+Files to create...
+1) src/core/state_store.py... SQLite kv store
+2) src/core/logger.py... JSONL logger
+3) src/core/clock.py... timezone and session window checks
+4) src/core/util.py... safe_halt, halt_active, clear_halt_if_expired
+5) src/core/risk.py... dollars_from_pct, valid_budget
+6) src/core/health.py... API failure tracking and stale price checks
+7) src/core/broker.py... Broker interface
+8) src/core/alpaca_broker.py... AlpacaBroker using alpaca-py TradingClient and latest trade requests for stocks and crypto
+
+Bots...
+- src/bots/exitbot.py... checks health and max daily loss... halts and flattens
+- src/bots/portfoliobot.py... writes per-bot budgets and allowed flags
+- src/bots/momentumbot.py... preflight gating... placeholder signal
+- src/bots/optionsbot.py... preflight gating... placeholder options logic
+- src/bots/cryptobot.py... preflight gating... placeholder signal
+
+Runner...
+- src/runner/bootstrap.py... set day_start_equity daily
+- src/runner/scheduler.py... loop runner
+- src/runner/main.py... fail-closed wrapper... instantiate bots... run in order
+
+Also create configs...
+settings.yaml and bots.yaml as described in the architecture.
+
+After file generation...
+Run a quick import test and print "BOOT_OK" if imports succeed.
+
+Do not implement real trading entries yet... keep execution bots in safe placeholder mode.
+```
+
+---
+
+If you want the next step to be real trading behavior... the first thing we implement is **CryptoBot entries with notional sizing** plus **max_trades_per_day** enforcement... then we’ll copy that discipline to MomentumBot... then options last.
