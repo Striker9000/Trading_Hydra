@@ -1,1 +1,0 @@
-"""Trading Hydra core package"""
